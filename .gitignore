@@ -1,0 +1,11 @@
+# Compiled strategy binary
+/long-short-harvest
+
+# Backtest output databases and logs
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# OS / editor cruft
+.DS_Store
