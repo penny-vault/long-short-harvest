@@ -32,57 +32,13 @@ type shortCandidate struct {
 	atr20 float64
 }
 
-// computeShortSleeve maintains the short book. It runs the ATR-distance
-// stop check daily and a full rebalance on Mondays, picking the top-N
-// trend-exhaustion candidates by composite Hurst-like score.
-func (s *LongShortHarvest) computeShortSleeve(ctx context.Context, eng *engine.Engine, port portfolio.Portfolio, batch *portfolio.Batch, today time.Time, plan *weightPlan) error {
-	// Daily ATR-stop sweep on existing shorts. Stops emit zero-weight in
-	// the plan so the position is liquidated on this day's rebalance.
-	covered := s.applyShortATRStops(port)
-	if len(covered) > 0 {
-		batch.Annotate("short_covered", strconv.FormatInt(int64(len(covered)), 10))
-		for sym := range covered {
-			plan.add(sym, 0)
-		}
-	}
-
-	// Off-Monday: pvbt's RebalanceTo liquidates any name not in the
-	// allocation, so existing shorts MUST appear in the plan or they get
-	// covered Tuesday morning. Emit each at its CURRENT REALIZED weight
-	// so RebalanceTo computes a zero-dollar adjustment and no order
-	// fires -- the share count stays constant and the realized weight
-	// drifts with price, matching QC's "shares held between rebalances"
-	// semantic. This relies on pvbt MaxLeverage being an entry-time gate
-	// only (post-pvbt-team change); adverse drift no longer triggers
-	// proactive liquidation.
-	holdings := port.Holdings()
-	portValue := port.Value()
-	for sym, qty := range holdings {
-		if qty >= 0 {
-			continue
-		}
-		if _, gone := covered[sym]; gone {
-			continue
-		}
-		if _, ok := s.shortEntry[sym]; !ok {
-			continue
-		}
-		realizedWeight := math.NaN()
-		if portValue > 0 {
-			realizedWeight = port.PositionValue(sym) / portValue
-		}
-		if math.IsNaN(realizedWeight) || realizedWeight >= 0 {
-			continue
-		}
-		plan.add(sym, realizedWeight)
-	}
-
-	if today.Weekday() != time.Monday {
-		return nil
-	}
-
-	// Monday rebalance: rank the candidate pool, keep top-N above threshold,
-	// short them equally to ShortGross.
+// rebalanceShort mirrors lsh.py Rebalance_Short (the Monday +30 min routine,
+// run after CheckSignal_Long). It ranks the active candidate pool by the
+// composite Hurst-like score, covers any existing short that fell out of the
+// new top-N selection, and shorts the picks equally to ShortGross. Entry price
+// and ATR are recorded for the daily ATR stop. Emission is incremental, so
+// shorts not touched here persist untouched between Mondays.
+func (s *LongShortHarvest) rebalanceShort(ctx context.Context, eng *engine.Engine, port portfolio.Portfolio, batch *portfolio.Batch) error {
 	if len(s.activeShorts) == 0 {
 		return nil
 	}
@@ -114,17 +70,17 @@ func (s *LongShortHarvest) computeShortSleeve(ctx context.Context, eng *engine.E
 		batch.Annotate("short_picked_names", fmt.Sprint(names))
 	}
 
-	// Drop weights for the previous shorts that did not make this week's
-	// selection: omit them from the plan and the rebalance liquidates.
+	// Cover the previous shorts that did not make this week's selection.
 	keep := make(map[asset.Asset]struct{}, len(picked))
 	for _, p := range picked {
 		keep[p.asset] = struct{}{}
 	}
 	for sym := range s.shortEntry {
 		if _, ok := keep[sym]; !ok {
-			// Mark for cover by ensuring no plan weight is added.
+			if err := batch.Liquidate(ctx, sym); err != nil {
+				return fmt.Errorf("cover short %s: %w", sym.Ticker, err)
+			}
 			delete(s.shortEntry, sym)
-			plan.add(sym, 0)
 		}
 	}
 
@@ -134,42 +90,57 @@ func (s *LongShortHarvest) computeShortSleeve(ctx context.Context, eng *engine.E
 
 	weight := -math.Abs(s.ShortGross) / float64(len(picked))
 	for _, c := range picked {
-		plan.add(c.asset, weight)
-		if existing, ok := s.shortEntry[c.asset]; ok {
-			existing.targetWeight = weight
-		} else {
+		if err := s.safeAllocate(ctx, port, batch, c.asset, weight); err != nil {
+			return fmt.Errorf("allocate short %s: %w", c.asset.Ticker, err)
+		}
+		// Record the entry only on a fresh short so the ATR stop measures from
+		// the original entry across reselects (lsh.py:605).
+		if _, ok := s.shortEntry[c.asset]; !ok {
 			s.shortEntry[c.asset] = &shortEntryState{
-				entryPrice:   c.close,
-				entryATR:     c.atr20,
-				targetWeight: weight,
+				entryPrice: c.close,
+				entryATR:   c.atr20,
 			}
 		}
 	}
-	plan.note(fmt.Sprintf("short: %d picked", len(picked)))
+
 	return nil
 }
 
-// applyShortATRStops covers any open short whose mark has run against the
-// trade by at least StopATR * entry-ATR. Returns the set of assets covered
-// so the caller can avoid re-emitting them.
-func (s *LongShortHarvest) applyShortATRStops(port portfolio.Portfolio) map[asset.Asset]struct{} {
-	out := make(map[asset.Asset]struct{})
+// riskCheckShort mirrors lsh.py RiskCheck_Short (the +160 min routine). For
+// each open short it covers the position when the live 12:10 intraday price has
+// run StopATR * entryATR against the entry. Positions that are no longer short
+// are dropped from the entry map.
+func (s *LongShortHarvest) riskCheckShort(ctx context.Context, eng *engine.Engine, port portfolio.Portfolio, batch *portfolio.Batch) error {
+	if len(s.shortEntry) == 0 {
+		return nil
+	}
+
+	syms := make([]asset.Asset, 0, len(s.shortEntry))
+	for sym := range s.shortEntry {
+		syms = append(syms, sym)
+	}
+	pxs := s.intradayPrices(ctx, eng, syms)
+
 	for sym, st := range s.shortEntry {
 		qty := port.Position(sym)
 		if qty >= 0 {
+			// Not (or no longer) short -- drop the entry, matching QC's pop.
 			delete(s.shortEntry, sym)
 			continue
 		}
-		px := s.lastKnownPrice(port, sym)
+		px := pxs[sym]
 		if math.IsNaN(px) || px <= 0 || st.entryATR <= 0 {
 			continue
 		}
-		if (px - st.entryPrice) >= s.StopATR*st.entryATR {
-			out[sym] = struct{}{}
+		if (px - st.entryPrice) > s.StopATR*st.entryATR {
+			if err := batch.Liquidate(ctx, sym); err != nil {
+				return fmt.Errorf("stop short %s: %w", sym.Ticker, err)
+			}
 			delete(s.shortEntry, sym)
 		}
 	}
-	return out
+
+	return nil
 }
 
 // rankShortCandidates fetches per-name OHLC history for each candidate and
@@ -469,16 +440,6 @@ func (s *LongShortHarvest) selectShortCandidates(candidates []shortCandidate) []
 		n = len(filtered)
 	}
 	return filtered[:n]
-}
-
-// positionWeight returns the current short weight for the asset (negative
-// for short positions). NaN if the portfolio value is non-positive.
-func positionWeight(port portfolio.Portfolio, sym asset.Asset) float64 {
-	v := port.Value()
-	if v <= 0 {
-		return math.NaN()
-	}
-	return port.PositionValue(sym) / v
 }
 
 func max0(x int) int {

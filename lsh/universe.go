@@ -19,21 +19,20 @@ import (
 // monthKey encodes year+month into a single int for cheap month-change tests.
 func monthKey(t time.Time) int { return t.Year()*100 + int(t.Month()) }
 
-// maybeRefreshUniverses runs at the START of Compute. It refreshes the SHORT
-// universe daily (QC reassigns self._active every time FineSelection fires
-// under Resolution.Daily). It also bootstraps the long top_set on Day 1:
+// maybeBootstrapLongUniverse runs at the START of the 10:00 slot. It populates
+// the long top_set the first time Compute runs so Day-1 has long positions --
 // QC's FineSelection runs on the first trading day BEFORE CheckSignal_Long
-// fires, so QC's Day 1 allocation already has top_set populated. Without the
-// Day-1 bootstrap, mine would have no long positions on Day 1.
+// fires, so QC's Day-1 allocation already has top_set populated.
 //
-// On subsequent month-changes, the long top_set is refreshed at the END of
-// Compute (in maybeRefreshLongUniverse), so today's allocation still uses
+// The SHORT universe is NOT refreshed here. QC reassigns self._active daily in
+// FineSelection, but the only consumer is Rebalance_Short, which fires solely
+// on Mondays; refreshing it once on Monday immediately before the rebalance is
+// behaviorally identical and avoids the expensive daily ~1800-name universe
+// scan (the dominant backtest cost). See refreshShortUniverse's call site in
+// Compute. On subsequent month-changes the long top_set is rotated at the END
+// of the 10:00 slot (maybeRefreshLongUniverse) so today's allocation still uses
 // last month's top_set and the new one takes effect tomorrow.
-func (s *LongShortHarvest) maybeRefreshUniverses(ctx context.Context, eng *engine.Engine, today time.Time) error {
-	if err := s.refreshShortUniverse(ctx, eng, today); err != nil {
-		return fmt.Errorf("refresh short universe: %w", err)
-	}
-	// Day-1 bootstrap: populate top_set the first time Compute runs.
+func (s *LongShortHarvest) maybeBootstrapLongUniverse(ctx context.Context, eng *engine.Engine, today time.Time) error {
 	if len(s.topSet) == 0 {
 		if err := s.refreshLongUniverse(ctx, eng, today); err != nil {
 			return fmt.Errorf("bootstrap long universe: %w", err)

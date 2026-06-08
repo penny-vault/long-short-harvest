@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"time"
 
 	"github.com/penny-vault/pvbt/asset"
 	"github.com/penny-vault/pvbt/data"
@@ -38,10 +37,34 @@ type regimeDecision struct {
 	goldWeight   float64 // fraction of LongGross to put into GLD
 }
 
-// computeLongSleeve fetches SPY+VIX history, runs the regime classifier,
-// allocates the top-4 names plus GLD, and applies the trailing-stop state
-// machine to long positions.
-func (s *LongShortHarvest) computeLongSleeve(ctx context.Context, eng *engine.Engine, port portfolio.Portfolio, batch *portfolio.Batch, today time.Time, plan *weightPlan) error {
+// checkSignalLong mirrors lsh.py CheckSignal_Long (the +30 min routine). It
+// first exits held longs that fell out of the top set (LiquidateNonTopLongsOnly),
+// then fetches SPY+VIX daily history, classifies the regime, and allocates the
+// top-set equity sleeve plus GLD via safeAllocate. Each sized name's trailing-
+// stop high-water mark is initialized off the live 10:00 intraday price. Order
+// emission is incremental (Allocate/Liquidate), so names left untouched keep
+// their existing positions.
+func (s *LongShortHarvest) checkSignalLong(ctx context.Context, eng *engine.Engine, port portfolio.Portfolio, batch *portfolio.Batch) error {
+	// LiquidateNonTopLongsOnly (lsh.py:273): exit held long positions that are
+	// not SPY/GLD and not in the current top set. Shorts (qty < 0) are left
+	// alone; the short sleeve manages them.
+	topMembers := assetSet(s.topSet)
+	for sym, qty := range port.Holdings() {
+		if qty <= 0 {
+			continue
+		}
+		if sym == s.spy || sym == s.gld {
+			continue
+		}
+		if _, ok := topMembers[sym]; ok {
+			continue
+		}
+		if err := batch.Liquidate(ctx, sym); err != nil {
+			return fmt.Errorf("liquidate non-top long %s: %w", sym.Ticker, err)
+		}
+		delete(s.longTrail, sym)
+	}
+
 	if len(s.topSet) == 0 {
 		return nil
 	}
@@ -50,13 +73,12 @@ func (s *LongShortHarvest) computeLongSleeve(ctx context.Context, eng *engine.En
 	//   self.History([self.spy], 200, Resolution.Daily)
 	//   self.History([self.vix], 100, Resolution.Daily)
 	// SPY is a standard equity; QC's History returns DIVIDEND-ADJUSTED
-	// closes. We pull data.AdjClose so the 21-day forward return labels
-	// in ML training and the spy_5d_ret in the panic branch agree with
-	// QC's calculations.
-	// VIX is a CUSTOM PythonData feed (CBOE CSV) which has no dividends,
-	// so adjusted == raw. For custom data, QC interprets the bar count
-	// as calendar days, yielding ~71 trading bars (100 * 5/7). Match
-	// QC's effective window: 71 VIX bars.
+	// closes. We pull data.AdjClose so the spy_5d_ret in the panic branch
+	// agrees with QC's calculation.
+	// VIX is a CUSTOM PythonData feed (CBOE CSV) which has no dividends, so
+	// adjusted == raw. For custom data, QC interprets the bar count as
+	// calendar days, yielding ~71 trading bars (100 * 5/7). Match QC's
+	// effective window: 71 VIX bars.
 	spyDF, err := eng.Fetch(ctx, []asset.Asset{s.spy}, tradingDays(220), []data.Metric{data.AdjClose})
 	if err != nil {
 		return fmt.Errorf("fetch SPY: %w", err)
@@ -69,13 +91,14 @@ func (s *LongShortHarvest) computeLongSleeve(ctx context.Context, eng *engine.En
 	spyClosesRaw := spyDF.Column(s.spy, data.AdjClose)
 	vixClosesRaw := vixDF.Column(s.vix, data.MetricClose)
 
-	// QC's CheckSignal_Long fires at +30 min after market open. At that
-	// time, today's daily SPY bar hasn't closed (close is at 4 PM ET), so
-	// History returns SPY bars through YESTERDAY's close. For VIX, QC
-	// loads it as a custom PythonData feed with bar.Time = midnight of
-	// the date, so the "today" VIX bar IS available at +30 min and shows
-	// up in History. Mismatched lag: SPY lagged 1 day, VIX current. Drop
-	// the last SPY bar to match.
+	// CheckSignal_Long fires at +30 min after the open. At that time today's
+	// daily SPY bar hasn't closed (close is 4 PM ET), so QC's History returns
+	// SPY bars through YESTERDAY's close. pvbt's daily Fetch anchors on the
+	// trading-day boundary even during an intraday firing, so it INCLUDES
+	// today's daily SPY bar -- drop the last bar to match QC's lag. For VIX,
+	// QC's custom feed timestamps the bar at midnight, so the "today" VIX bar
+	// IS available at +30 min; we keep it (no drop). Mismatched lag by design:
+	// SPY lagged one day, VIX current.
 	if len(spyClosesRaw) > 0 {
 		spyClosesRaw = spyClosesRaw[:len(spyClosesRaw)-1]
 	}
@@ -91,7 +114,6 @@ func (s *LongShortHarvest) computeLongSleeve(ctx context.Context, eng *engine.En
 	decision := s.classifyRegime(vixCloses, spyCloses)
 	batch.Annotate("regime", string(decision.branch))
 	batch.Annotate("ml_bullish", boolStr(decision.mlBullish))
-	plan.note(fmt.Sprintf("long: %s ml=%v", decision.branch, decision.mlBullish))
 
 	// Record the regime intermediates for cross-comparison with QC's
 	// classifier on the same SPY/VIX series.
@@ -101,7 +123,7 @@ func (s *LongShortHarvest) computeLongSleeve(ctx context.Context, eng *engine.En
 	spyNow := spyCloses[len(spyCloses)-1]
 	spySMA50 := mean(spyCloses[len(spyCloses)-50:])
 	spySMA200 := mean(spyCloses[len(spyCloses)-200:])
-	spy5d := returnNAgo(spyCloses, 4) // see classifyRegime: QC's spy_5d_ret is 4-bar
+	spy5d := returnNAgo(spyCloses, 4) // QC's spy_5d_ret is the 4-bar return
 	batch.Annotate("vix", fmt.Sprintf("%.4f", currentVix))
 	batch.Annotate("vix_sma20", fmt.Sprintf("%.4f", vixSMA20))
 	batch.Annotate("vix_p80", fmt.Sprintf("%.4f", vixP80))
@@ -110,63 +132,123 @@ func (s *LongShortHarvest) computeLongSleeve(ctx context.Context, eng *engine.En
 	batch.Annotate("spy_sma200", fmt.Sprintf("%.4f", spySMA200))
 	batch.Annotate("spy_5d_ret", fmt.Sprintf("%.6f", spy5d))
 
-	// Distribute the equity sleeve across the top-4 with the ML overweight
-	// tilt and per-name caps applied.
+	// Equity sleeve: distribute LongGross * equityWeight across the top set.
 	equityTotal := s.LongGross * decision.equityWeight
-	weights := s.allocateTopWeights(equityTotal, decision.mlBullish)
 
-	// Apply trailing-stop adjustments: stage 0 holds full weight, stage 1
-	// trims to 2/3, stage 2 to 1/3, stage 3 liquidates. Stage transitions
-	// happen inside maintainLongTrails.
-	s.maintainLongTrails(port, today)
+	// Live 10:00 intraday prices for trailing-stop high-water initialization.
+	pxs := s.intradayPrices(ctx, eng, s.topSet)
 
-	// Names dropped from the top-4 since the previous month are exited
-	// implicitly: weightPlan never adds them, RebalanceTo liquidates anything
-	// not in the new allocation. Their trail state is cleaned up here.
-	current := assetSet(s.topSet)
+	if equityTotal <= 0 {
+		// QC AllocateTop with TW <= 0 liquidates every top-set long and drops
+		// its trail state (lsh.py:242-247).
+		for _, sym := range s.topSet {
+			if port.Position(sym) > 0 {
+				if err := batch.Liquidate(ctx, sym); err != nil {
+					return fmt.Errorf("liquidate top %s: %w", sym.Ticker, err)
+				}
+			}
+			delete(s.longTrail, sym)
+		}
+	} else {
+		weights := s.allocateTopWeights(equityTotal, decision.mlBullish)
+		for i, sym := range s.topSet {
+			if i >= len(weights) {
+				break
+			}
+			if err := s.safeAllocate(ctx, port, batch, sym, weights[i]); err != nil {
+				return fmt.Errorf("allocate top %s: %w", sym.Ticker, err)
+			}
+			s.ensureLongTrailState(sym, weights[i], pxs[sym])
+		}
+		// QC AllocateTop liquidates SPY if invested (defensive; never longed).
+		if err := batch.Liquidate(ctx, s.spy); err != nil {
+			return fmt.Errorf("liquidate spy: %w", err)
+		}
+	}
+
+	// GLD sleeve gets the complementary weight (zero liquidates it).
+	gldTotal := s.LongGross * decision.goldWeight
+	if err := s.safeAllocate(ctx, port, batch, s.gld, gldTotal); err != nil {
+		return fmt.Errorf("allocate gld: %w", err)
+	}
+
+	// Names dropped from the top set since the previous month are cleaned out
+	// of the trail map here as a backstop (the day's LiquidateNonTopLongsOnly
+	// already exited them and dropped their state).
 	for a := range s.longTrail {
-		if _, kept := current[a]; !kept {
+		if _, kept := topMembers[a]; !kept {
 			delete(s.longTrail, a)
 		}
 	}
 
-	// QC's SetHoldings has a tolerance (default 0.0025 = 0.25% of portfolio
-	// value) that suppresses orders when the existing position is already
-	// within the tolerance band of the target. Pvbt's RebalanceTo has no
-	// such tolerance and fires an adjustment whenever the realized weight
-	// differs from the target by any amount, which produced 3-6x more
-	// long-sleeve orders than QC and added meaningful slippage drag.
-	// Replicate QC's tolerance: if realized weight is within 0.25% of
-	// target, emit realized (no order fires); else emit target.
-	const longTolerance = 0.0025
+	return nil
+}
 
-	portValue := port.Value()
-	for i, sym := range s.topSet {
-		if i >= len(weights) {
-			break
+// riskCheckLong mirrors lsh.py RiskCheck_Long (the +90 min routine). For each
+// held top-set name it advances the trailing-stop state machine off the live
+// 11:00 intraday price: stage 0 -> 1 trims to two-thirds of the full target
+// weight, stage 1 -> 2 to one-third, stage 2 -> 3 liquidates. Each transition
+// resets the high-water mark to the trigger price, matching QC.
+func (s *LongShortHarvest) riskCheckLong(ctx context.Context, eng *engine.Engine, port portfolio.Portfolio, batch *portfolio.Batch) error {
+	if len(s.longTrail) == 0 {
+		return nil
+	}
+
+	// Cleanup: drop trail state for names no longer held long (QC pops any
+	// position that is not invested or has gone non-positive).
+	for sym := range s.longTrail {
+		if port.Position(sym) <= 0 {
+			delete(s.longTrail, sym)
 		}
-		base := weights[i]
-		target := s.applyLongTrailStage(sym, base, port)
-		emit := target
-		if portValue > 0 && target > 0 {
-			realized := port.PositionValue(sym) / portValue
-			if math.Abs(target-realized) < longTolerance {
-				emit = realized
+	}
+
+	// Iterate the top set in its stable (market-cap) order for deterministic
+	// emission; QC's stage machine only acts on names in self._top_set.
+	pxs := s.intradayPrices(ctx, eng, s.topSet)
+	for _, sym := range s.topSet {
+		st, ok := s.longTrail[sym]
+		if !ok {
+			continue
+		}
+		px := pxs[sym]
+		if math.IsNaN(px) || px <= 0 {
+			continue
+		}
+		if px > st.high {
+			st.high = px
+		}
+		if st.high <= 0 {
+			continue
+		}
+		dd := (st.high - px) / st.high
+
+		switch st.stage {
+		case 0:
+			if dd >= s.LongTrail1 {
+				if err := s.safeAllocate(ctx, port, batch, sym, st.targetW*2.0/3.0); err != nil {
+					return fmt.Errorf("trail trim %s: %w", sym.Ticker, err)
+				}
+				st.stage = 1
+				st.high = px
+			}
+		case 1:
+			if dd >= s.LongTrail2 {
+				if err := s.safeAllocate(ctx, port, batch, sym, st.targetW*1.0/3.0); err != nil {
+					return fmt.Errorf("trail trim %s: %w", sym.Ticker, err)
+				}
+				st.stage = 2
+				st.high = px
+			}
+		case 2:
+			if dd >= s.LongTrail3 {
+				if err := batch.Liquidate(ctx, sym); err != nil {
+					return fmt.Errorf("trail liquidate %s: %w", sym.Ticker, err)
+				}
+				delete(s.longTrail, sym)
 			}
 		}
-		plan.add(sym, emit)
-		s.ensureLongTrailState(sym, base, port)
 	}
 
-	gldTarget := s.LongGross * decision.goldWeight
-	gldEmit := gldTarget
-	if portValue > 0 && gldTarget > 0 {
-		gldRealized := port.PositionValue(s.gld) / portValue
-		if math.Abs(gldTarget-gldRealized) < longTolerance {
-			gldEmit = gldRealized
-		}
-	}
-	plan.add(s.gld, gldEmit)
 	return nil
 }
 
@@ -192,10 +274,7 @@ func (s *LongShortHarvest) classifyRegime(vixCloses, spyCloses []float64) regime
 	spySMA200 := mean(spyCloses[len(spyCloses)-200:])
 	// QC's variable is named spy_5d_ret but the formula is closes[-1]/closes[-5]
 	// which spans only FOUR bars (positions t-4..t, five elements). Use the
-	// 4-bar form here to match QC's panic-branch threshold exactly. Calling
-	// returnNAgo(closes, 5) would compute the natural 5-bar return and shift
-	// the panic boundary by enough to flip the regime decision on a handful
-	// of borderline days each year.
+	// 4-bar form here to match QC's panic-branch threshold exactly.
 	spy5d := returnNAgo(spyCloses, 4)
 
 	// Branch 1: panic.
@@ -330,54 +409,10 @@ func capAndRenormalize(weights []float64, target, wmin, wmax float64) []float64 
 	return w
 }
 
-// maintainLongTrails walks each tracked long position, advancing the high-
-// water mark and the trailing-stop stage. Liquidations (stage 3) drop the
-// entry from the trail map; the absence of a weight in the plan triggers the
-// actual sell via RebalanceTo.
-func (s *LongShortHarvest) maintainLongTrails(port portfolio.Portfolio, today time.Time) {
-	for sym, st := range s.longTrail {
-		qty := port.Position(sym)
-		if qty <= 0 {
-			delete(s.longTrail, sym)
-			continue
-		}
-
-		px := s.lastKnownPrice(port, sym)
-		if math.IsNaN(px) || px <= 0 {
-			continue
-		}
-
-		if px > st.high {
-			st.high = px
-		}
-		dd := 0.0
-		if st.high > 0 {
-			dd = (st.high - px) / st.high
-		}
-
-		switch st.stage {
-		case 0:
-			if dd >= s.LongTrail1 {
-				st.stage = 1
-				st.high = px
-			}
-		case 1:
-			if dd >= s.LongTrail2 {
-				st.stage = 2
-				st.high = px
-			}
-		case 2:
-			if dd >= s.LongTrail3 {
-				st.stage = 3
-			}
-		}
-	}
-	_ = today
-}
-
 // applyLongTrailStage scales a base target weight by the trim factor implied
-// by the current trailing-stop stage for that asset.
-func (s *LongShortHarvest) applyLongTrailStage(sym asset.Asset, base float64, port portfolio.Portfolio) float64 {
+// by the current trailing-stop stage for that asset. Retained for unit-test
+// coverage of the stage-scaling factors used by riskCheckLong.
+func (s *LongShortHarvest) applyLongTrailStage(sym asset.Asset, base float64, _ portfolio.Portfolio) float64 {
 	st, ok := s.longTrail[sym]
 	if !ok {
 		return base
@@ -394,47 +429,24 @@ func (s *LongShortHarvest) applyLongTrailStage(sym asset.Asset, base float64, po
 	}
 }
 
-// ensureLongTrailState creates the per-position trail entry on first
-// inclusion or refreshes the recorded target weight when sizing changes. The
-// high-water mark is initialized to the current price so the first stop
-// trigger requires a real drawdown rather than an immediate trim.
-func (s *LongShortHarvest) ensureLongTrailState(sym asset.Asset, target float64, port portfolio.Portfolio) {
+// ensureLongTrailState creates the per-position trail entry on first inclusion
+// (high-water seeded to the current intraday price) or refreshes the recorded
+// full target weight when sizing changes, leaving the high-water mark and stage
+// intact. Mirrors QC's _ensure_long_trail_state (lsh.py:224).
+func (s *LongShortHarvest) ensureLongTrailState(sym asset.Asset, target, px float64) {
 	if target <= 0 {
 		delete(s.longTrail, sym)
 		return
 	}
-
-	px := s.lastKnownPrice(port, sym)
 	if math.IsNaN(px) || px <= 0 {
 		return
 	}
-
 	st, ok := s.longTrail[sym]
 	if !ok {
 		s.longTrail[sym] = &longTrailState{high: px, stage: 0, targetW: target}
 		return
 	}
 	st.targetW = target
-}
-
-// lastKnownPrice returns the most recent close for the asset from the
-// portfolio's price snapshot. Prefer this over the engine's data store
-// because it reflects the prices the engine just updated for this step.
-func (s *LongShortHarvest) lastKnownPrice(port portfolio.Portfolio, sym asset.Asset) float64 {
-	prices := port.Prices()
-	if prices == nil {
-		return math.NaN()
-	}
-	col := prices.Column(sym, data.MetricClose)
-	if len(col) == 0 {
-		return math.NaN()
-	}
-	for i := len(col) - 1; i >= 0; i-- {
-		if !math.IsNaN(col[i]) {
-			return col[i]
-		}
-	}
-	return math.NaN()
 }
 
 func assetSet(assets []asset.Asset) map[asset.Asset]struct{} {
